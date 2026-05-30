@@ -855,6 +855,10 @@ code {
   display: none;
 }
 
+.topbar-signout-btn .topbar-signout-label {
+  display: none;
+}
+
 .page-view {
   min-width: 0;
   padding: 16px;
@@ -1825,6 +1829,10 @@ code {
     display: inline-flex;
   }
 
+  .topbar-signout-btn .topbar-signout-label {
+    display: inline;
+  }
+
   .topbar-user {
     max-width: 190px;
     align-items: center;
@@ -1887,9 +1895,7 @@ code {
 }
 
 @media (max-width: 430px) {
-  .brand span:last-child,
-  .button.ghost.compact span,
-  .topbar-actions .button {
+  .brand span:last-child {
     display: none;
   }
 

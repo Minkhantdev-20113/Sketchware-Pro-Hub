@@ -108,9 +108,12 @@ export function readPersistedSession() {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (parsed?.access_token && parsed?.user) return parsed;
-    if (parsed?.currentSession?.access_token) return parsed.currentSession;
-    return null;
+    const session = parsed?.access_token && parsed?.user ? parsed : parsed?.currentSession?.access_token ? parsed.currentSession : null;
+    if (!session?.access_token || !session?.user) return null;
+    if (session.expires_at && session.expires_at * 1000 < Date.now() - 5000) {
+      return null;
+    }
+    return session;
   } catch (error) {
     logUploadError("session:localStorage-parse", error);
     return null;
@@ -187,12 +190,62 @@ async function prepareUploadAuth(client, options = {}) {
       logUploadError("session:refresh-failed", error);
       throw new Error("Session expired. Please sign out and sign in again.");
     }
-  } else {
-    await syncClientSession(client, auth.session);
   }
 
   onProgress?.({ message: "Session ready", percent: 10 });
   return auth;
+}
+
+async function restRequest(path, { method = "GET", token, body, signal, timeout = 30_000, prefer = "return=representation" }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+
+  try {
+    const response = await fetch(`${CONFIG.supabaseUrl}${path}`, {
+      method,
+      headers: {
+        apikey: CONFIG.supabaseAnonKey,
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Prefer: prefer
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller.signal
+    });
+
+    const text = await response.text();
+    let json = null;
+    if (text) {
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = null;
+      }
+    }
+
+    if (!response.ok) {
+      const message = json?.message || json?.error || json?.hint || text || `Request failed (${response.status})`;
+      throw new Error(message);
+    }
+
+    return json;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("Request timed out or was cancelled.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function restRow(result) {
+  if (result == null) return result;
+  return Array.isArray(result) ? result[0] : result;
 }
 
 async function currentUser(client) {
@@ -264,25 +317,11 @@ async function uploadStorageFile(bucket, userId, resourceType, file, auth, onPro
 
   const extension = file.name.includes(".") ? file.name.split(".").pop() : "bin";
   const path = `${userId}/${resourceType}/${randomId()}-${slug(file.name || `upload.${extension}`)}`;
-  const client = await getSupabase();
 
   onProgress?.({ message: "Uploading to storage...", percent: 20 });
 
-  const { error: sdkError } = await client.storage.from(bucket).upload(path, file, {
-    cacheControl: "31536000",
-    upsert: false
-  });
-
-  if (!sdkError) {
-    logUpload("storage:sdk-success", { bucket, path });
-    onProgress?.({ message: "Storage upload complete", percent: 82 });
-    return path;
-  }
-
-  logUploadError("storage:sdk", sdkError);
-
   const url = `${CONFIG.supabaseUrl}/storage/v1/object/${bucket}/${encodeStoragePath(path)}`;
-  logUpload("storage:xhr-fallback", { url });
+  logUpload("storage:xhr", { url, size: file.size });
 
   await withTimeout(
     xhrStorageUpload({
@@ -294,14 +333,14 @@ async function uploadStorageFile(bucket, userId, resourceType, file, auth, onPro
       onProgress: (pct) =>
         onProgress?.({
           message: `Uploading: ${pct}%`,
-          percent: 20 + Math.round(pct * 0.6)
+          percent: 20 + Math.round(pct * 0.55)
         })
     }),
-    UPLOAD_TIMEOUT_MS,
-    "File upload"
+    90_000,
+    "Storage upload"
   );
 
-  logUpload("storage:xhr-success", { bucket, path });
+  logUpload("storage:success", { bucket, path });
   onProgress?.({ message: "Storage upload complete", percent: 82 });
   return path;
 }
@@ -318,69 +357,107 @@ export async function getCurrentContext() {
     return { session: null, user: null, profile: null };
   }
 
-  const client = await getSupabase();
   const persisted = readPersistedSession();
-  if (persisted?.user) {
-    await syncClientSession(client, persisted);
-    const profile = await ensureProfile(persisted.user);
+  if (persisted?.user && persisted.access_token) {
+    let profile = null;
+    try {
+      profile = await ensureProfile(persisted.user, persisted.access_token);
+    } catch (error) {
+      console.error("[SketchVault] profile load failed", error);
+    }
     return { session: persisted, user: persisted.user, profile };
   }
 
-  const { data, error } = await withTimeout(client.auth.getSession(), REFRESH_TIMEOUT_MS, "Session load");
-  if (error) throw error;
-  if (!data.session?.user) {
+  try {
+    const client = await getSupabase();
+    const { data, error } = await withTimeout(client.auth.getSession(), 12_000, "Session load");
+    if (error || !data.session?.user) {
+      return { session: null, user: null, profile: null };
+    }
+    let profile = null;
+    try {
+      profile = await ensureProfile(data.session.user, data.session.access_token);
+    } catch (profileError) {
+      console.error("[SketchVault] profile load failed", profileError);
+    }
+    return { session: data.session, user: data.session.user, profile };
+  } catch {
     return { session: null, user: null, profile: null };
   }
-
-  const profile = await ensureProfile(data.session.user);
-  return { session: data.session, user: data.session.user, profile };
 }
 
-export async function ensureProfile(user) {
-  const client = await getSupabase();
+export async function ensureProfile(user, accessToken) {
+  const token = accessToken || readPersistedSession()?.access_token;
+  if (!token) throw new Error("Missing auth token for profile sync.");
+
   const username =
     user.user_metadata?.username ||
     user.user_metadata?.full_name ||
     user.email?.split("@")[0] ||
     "Member";
 
-  const { data, error } = await client
-    .from("profiles")
-    .upsert(
-      {
+  try {
+    return restRow(
+      await restRequest(`/rest/v1/profiles?id=eq.${user.id}`, {
+        method: "PATCH",
+        token,
+        body: { username, updated_at: new Date().toISOString() }
+      })
+    );
+  } catch {
+    return restRow(
+      await restRequest("/rest/v1/profiles", {
+      method: "POST",
+      token,
+      prefer: "return=representation",
+      body: {
         id: user.id,
         username,
         updated_at: new Date().toISOString()
-      },
-      { onConflict: "id" }
-    )
-    .select("*")
-    .single();
-
-  if (error) throw error;
-  return data;
+      }
+      })
+    );
+  }
 }
 
 export async function signInWithEmail(email, password) {
   const client = await getSupabase();
-  const { data, error } = await client.auth.signInWithPassword({ email, password });
+  const { data, error } = await withTimeout(
+    client.auth.signInWithPassword({ email, password }),
+    30_000,
+    "Sign in"
+  );
   if (error) throw error;
-  if (data.user) await ensureProfile(data.user);
-  return data;
+  if (!data.session?.user) {
+    throw new Error("Sign in failed. Confirm your email first if confirmation is required in Supabase.");
+  }
+
+  const profile = await ensureProfile(data.session.user, data.session.access_token);
+  return { session: data.session, user: data.user, profile };
 }
 
 export async function signUpWithEmail(username, email, password) {
   const client = await getSupabase();
-  const { data, error } = await client.auth.signUp({
-    email,
-    password,
-    options: {
-      data: { username }
-    }
-  });
+  const { data, error } = await withTimeout(
+    client.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { username }
+      }
+    }),
+    30_000,
+    "Sign up"
+  );
   if (error) throw error;
-  if (data.user) await ensureProfile({ ...data.user, user_metadata: { ...data.user.user_metadata, username } });
-  return data;
+
+  if (!data.session?.user) {
+    return { session: null, user: data.user, profile: null, needsEmailConfirmation: true };
+  }
+
+  const user = { ...data.user, user_metadata: { ...data.user.user_metadata, username } };
+  const profile = await ensureProfile(user, data.session.access_token);
+  return { session: data.session, user: data.user, profile, needsEmailConfirmation: false };
 }
 
 export async function signInWithProvider(provider) {
@@ -418,91 +495,125 @@ export async function onAuthStateChange(callback) {
   if (!configured()) return () => {};
   const client = await getSupabase();
   const { data } = client.auth.onAuthStateChange(async (_event, session) => {
-    const profile = session?.user ? await ensureProfile(session.user) : null;
+    let profile = null;
+    if (session?.user && session.access_token) {
+      try {
+        profile = await ensureProfile(session.user, session.access_token);
+      } catch (error) {
+        console.error("[SketchVault] profile sync on auth change failed", error);
+      }
+    }
     callback({ session, user: session?.user || null, profile });
   });
   return () => data.subscription.unsubscribe();
 }
 
-async function favoriteIds(kind, ids) {
+function authFromOptions(options = {}) {
+  const auth = buildAuthContext(options.session, options.user);
+  if (!auth) throw new Error("Please sign in again.");
+  return auth;
+}
+
+async function favoriteIdsRest(kind, ids, token) {
   if (!ids.length) return new Set();
-  const client = await getSupabase();
-  const { data, error } = await client
-    .from("favorites")
-    .select("item_id")
-    .eq("item_kind", kind)
-    .in("item_id", ids);
-  if (error) throw error;
-  return new Set((data || []).map((item) => item.item_id));
+  const rows = await restRequest(
+    `/rest/v1/favorites?item_kind=eq.${encodeURIComponent(kind)}&item_id=in.(${ids.join(",")})&select=item_id`,
+    { method: "GET", token, timeout: 20_000 }
+  );
+  const list = Array.isArray(rows) ? rows : rows ? [rows] : [];
+  return new Set(list.map((item) => item.item_id));
 }
 
-async function signedUrl(bucket, path, expiresIn = 60 * 60) {
-  if (!path) return "";
-  const client = await getSupabase();
-  const { data, error } = await client.storage.from(bucket).createSignedUrl(path, expiresIn);
-  if (error) return "";
-  return data?.signedUrl || "";
+async function createSignedUrlRest(bucket, path, token, expiresIn = 3600) {
+  if (!path || !token) return "";
+  try {
+    const response = await fetch(
+      `${CONFIG.supabaseUrl}/storage/v1/object/sign/${bucket}/${encodeStoragePath(path)}`,
+      {
+        method: "POST",
+        headers: {
+          apikey: CONFIG.supabaseAnonKey,
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ expiresIn })
+      }
+    );
+    if (!response.ok) return "";
+    const json = await response.json();
+    const raw = json.signedURL || json.signedUrl || "";
+    if (!raw) return "";
+    if (raw.startsWith("http")) return raw;
+    if (raw.startsWith("/")) return `${CONFIG.supabaseUrl}/storage/v1${raw}`;
+    return `${CONFIG.supabaseUrl}/storage/v1/object/sign/${bucket}/${encodeStoragePath(path)}?token=${raw}`;
+  } catch {
+    return "";
+  }
 }
 
-async function enrichResource(item, favorites) {
-  const iconUrl = item.icon_path ? await signedUrl(ICON_BUCKET, item.icon_path) : "";
-  const previewOneUrl = item.preview_one_path ? await signedUrl(PREVIEW_BUCKET, item.preview_one_path) : "";
-  const previewTwoUrl = item.preview_two_path ? await signedUrl(PREVIEW_BUCKET, item.preview_two_path) : "";
-  const filePreviewUrl = item.resource_type === "icon" ? await signedUrl(RESOURCE_BUCKET, item.file_path) : "";
+async function enrichResourceItem(item, favorites, token) {
+  let icon_url = "";
+  if (item.resource_type === "icon" && item.file_path) {
+    icon_url = await createSignedUrlRest(RESOURCE_BUCKET, item.file_path, token);
+  } else if (item.icon_path) {
+    icon_url = await createSignedUrlRest(ICON_BUCKET, item.icon_path, token);
+  }
   return {
     ...item,
     is_favorite: favorites.has(item.id),
-    icon_url: iconUrl || filePreviewUrl,
-    preview_one_url: previewOneUrl,
-    preview_two_url: previewTwoUrl
+    icon_url,
+    preview_one_url: "",
+    preview_two_url: ""
   };
 }
 
-export async function listResources(resourceType) {
-  const client = await getSupabase();
-  const { data, error } = await client
-    .from("resource_items")
-    .select("*")
-    .eq("resource_type", resourceType)
-    .order("created_at", { ascending: false });
-  if (error) throw error;
-
-  const favorites = await favoriteIds("resource", (data || []).map((item) => item.id));
-  return Promise.all((data || []).map((item) => enrichResource(item, favorites)));
+export async function listResources(resourceType, options = {}) {
+  const auth = authFromOptions(options);
+  const rows = await restRequest(
+    `/rest/v1/resource_items?resource_type=eq.${encodeURIComponent(resourceType)}&select=*&order=created_at.desc`,
+    { method: "GET", token: auth.accessToken, timeout: 45_000 }
+  );
+  const items = Array.isArray(rows) ? rows : rows ? [rows] : [];
+  const favorites = await favoriteIdsRest("resource", items.map((item) => item.id), auth.accessToken);
+  return Promise.all(items.map((item) => enrichResourceItem(item, favorites, auth.accessToken)));
 }
 
-export async function listJavaCodes() {
-  const client = await getSupabase();
-  const { data, error } = await client
-    .from("java_codes")
-    .select("*")
-    .order("created_at", { ascending: false });
-  if (error) throw error;
-
-  const favorites = await favoriteIds("java", (data || []).map((item) => item.id));
-  return (data || []).map((item) => ({ ...item, is_favorite: favorites.has(item.id) }));
+export async function listJavaCodes(options = {}) {
+  const auth = authFromOptions(options);
+  const rows = await restRequest(
+    `/rest/v1/java_codes?select=*&order=created_at.desc`,
+    { method: "GET", token: auth.accessToken, timeout: 45_000 }
+  );
+  const items = Array.isArray(rows) ? rows : rows ? [rows] : [];
+  const favorites = await favoriteIdsRest("java", items.map((item) => item.id), auth.accessToken);
+  return items.map((item) => ({ ...item, is_favorite: favorites.has(item.id) }));
 }
 
-export async function loadDashboardData() {
-  const client = await getSupabase();
-  const [resources, java] = await Promise.all([
-    client.from("resource_items").select("*").order("created_at", { ascending: false }),
-    client.from("java_codes").select("*").order("created_at", { ascending: false })
+export async function loadDashboardData(options = {}) {
+  const auth = authFromOptions(options);
+  const [resources, javaCodes] = await Promise.all([
+    restRequest("/rest/v1/resource_items?select=*&order=created_at.desc", {
+      method: "GET",
+      token: auth.accessToken,
+      timeout: 45_000
+    }),
+    restRequest("/rest/v1/java_codes?select=*&order=created_at.desc", {
+      method: "GET",
+      token: auth.accessToken,
+      timeout: 45_000
+    })
   ]);
 
-  if (resources.error) throw resources.error;
-  if (java.error) throw java.error;
-
-  const allResources = resources.data || [];
-  const javaCodes = java.data || [];
+  const allResources = Array.isArray(resources) ? resources : resources ? [resources] : [];
+  const javaList = Array.isArray(javaCodes) ? javaCodes : javaCodes ? [javaCodes] : [];
   const all = [
     ...allResources.map((item) => ({ ...item, display_name: item.file_name, kind: item.resource_type })),
-    ...javaCodes.map((item) => ({ ...item, display_name: item.code_name, kind: "java" }))
+    ...javaList.map((item) => ({ ...item, display_name: item.code_name, kind: "java" }))
   ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
   return {
     resources: allResources,
-    javaCodes,
+    javaCodes: javaList,
     recent: all.slice(0, 8)
   };
 }
@@ -578,16 +689,19 @@ export async function saveResource(resourceType, values, files, existing = null,
 
     onProgress?.({ message: "Saving record...", percent: 88 });
 
-    const query = existing
-      ? client.from("resource_items").update(payload).eq("id", existing.id).select("*").single()
-      : client
-          .from("resource_items")
-          .insert({ ...payload, owner_id: auth.userId, download_count: 0 })
-          .select("*")
-          .single();
-
-    const { data, error } = await query;
-    if (error) throw error;
+    const data = existing
+      ? await restRequest(`/rest/v1/resource_items?id=eq.${existing.id}`, {
+          method: "PATCH",
+          token: auth.accessToken,
+          body: payload,
+          signal
+        })
+      : await restRequest("/rest/v1/resource_items", {
+          method: "POST",
+          token: auth.accessToken,
+          body: { ...payload, owner_id: auth.userId, download_count: 0 },
+          signal
+        });
 
     if (existing) {
       await Promise.all([
@@ -603,8 +717,9 @@ export async function saveResource(resourceType, values, files, existing = null,
     }
 
     onProgress?.({ message: "Upload complete!", percent: 100 });
-    logUpload("saveResource:done", { id: data?.id });
-    return data;
+    const saved = restRow(data);
+    logUpload("saveResource:done", { id: saved?.id });
+    return saved;
   } catch (error) {
     logUploadError("saveResource:failed", error);
     await Promise.all(cleanup.map(([bucket, path]) => removeStorageFiles(bucket, [path])));
@@ -623,25 +738,47 @@ export async function deleteResource(item) {
   ]);
 }
 
-export async function saveJavaCode(values, existing = null) {
+async function saveJavaCodeRow(auth, payload, existing, options) {
+  const result = existing
+    ? await restRequest(`/rest/v1/java_codes?id=eq.${existing.id}`, {
+        method: "PATCH",
+        token: auth.accessToken,
+        body: payload,
+        signal: options.signal
+      })
+    : await restRequest("/rest/v1/java_codes", {
+        method: "POST",
+        token: auth.accessToken,
+        body: { ...payload, owner_id: auth.userId },
+        signal: options.signal
+      });
+  return restRow(result);
+}
+
+export async function saveJavaCode(values, existing = null, options = {}) {
   const client = await getSupabase();
-  const user = await currentUser(client);
+  const auth = await prepareUploadAuth(client, options);
   const payload = {
     code_name: values.codeName.trim(),
-    description: values.description?.trim() || "",
     source_code: values.sourceCode.trim(),
     category: values.category || "Utilities",
     sort_key: values.sortKey || "newest",
     updated_at: new Date().toISOString()
   };
 
-  const query = existing
-    ? client.from("java_codes").update(payload).eq("id", existing.id).select("*").single()
-    : client.from("java_codes").insert({ ...payload, owner_id: user.id }).select("*").single();
+  const description = values.description?.trim();
+  logUpload("java:save", { existing: Boolean(existing), userId: auth.userId });
 
-  const { data, error } = await query;
-  if (error) throw error;
-  return data;
+  if (description) {
+    try {
+      return await saveJavaCodeRow(auth, { ...payload, description }, existing, options);
+    } catch (error) {
+      if (!/description/i.test(String(error.message))) throw error;
+      logUpload("java:save-without-description", "column missing — run supabase/migrations/add_java_description.sql");
+    }
+  }
+
+  return saveJavaCodeRow(auth, payload, existing, options);
 }
 
 export async function deleteJavaCode(item) {

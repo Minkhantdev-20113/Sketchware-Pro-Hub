@@ -291,13 +291,14 @@ async function loadRouteData(force = false) {
     state.dataLoading = true;
     render();
   }
+  const authOpts = { session: state.session, user: state.user };
   try {
     if (route === "dashboard") {
-      state.data.dashboard = await loadDashboardData();
+      state.data.dashboard = await loadDashboardData(authOpts);
     } else if (route === "java") {
-      state.data.java = await listJavaCodes();
+      state.data.java = await listJavaCodes(authOpts);
     } else if (resourcePages[route]) {
-      state.data[route] = await listResources(resourcePages[route].type);
+      state.data[route] = await listResources(resourcePages[route].type, authOpts);
     }
   } catch (error) {
     toast(readableError(error), "error");
@@ -606,7 +607,10 @@ function renderTopbar() {
         <span class="avatar">${initials(username())}</span>
         <span>${escapeHtml(username())}</span>
       </div>
-      <button class="button ghost compact" type="button" data-action="signout">${icon("logout", 18)}${t("common.signOut")}</button>
+      <button class="button ghost compact topbar-signout-btn" type="button" data-action="signout" title="${t("common.signOut")}" aria-label="${t("common.signOut")}">
+        ${icon("logout", 18)}
+        <span class="topbar-signout-label">${t("common.signOut")}</span>
+      </button>
     </div>
   </header>`;
 }
@@ -1377,6 +1381,7 @@ async function handleClick(event) {
       render();
       break;
     case "signout":
+      state.mobileNavOpen = false;
       await runAction(actionEl, signOut, "Signing out...");
       state.user = null;
       state.profile = null;
@@ -1461,11 +1466,10 @@ async function handleSubmit(event) {
     case "signin":
       await runAction(submit, async () => {
         const data = new FormData(form);
-        await signInWithEmail(data.get("email"), data.get("password"));
-        const context = await getCurrentContext();
-        state.session = context.session;
-        state.user = context.user;
-        state.profile = context.profile;
+        const result = await signInWithEmail(data.get("email"), data.get("password"));
+        state.session = result.session;
+        state.user = result.user;
+        state.profile = result.profile;
         toast("Signed in successfully.", "success");
         navigate("dashboard");
       });
@@ -1473,11 +1477,16 @@ async function handleSubmit(event) {
     case "signup":
       await runAction(submit, async () => {
         const data = new FormData(form);
-        await signUpWithEmail(data.get("username"), data.get("email"), data.get("password"));
-        const context = await getCurrentContext();
-        state.session = context.session;
-        state.user = context.user;
-        state.profile = context.profile;
+        const result = await signUpWithEmail(data.get("username"), data.get("email"), data.get("password"));
+        if (result.needsEmailConfirmation) {
+          toast("Account created. Check your email to confirm, then sign in.", "success");
+          state.authMode = "signin";
+          render();
+          return;
+        }
+        state.session = result.session;
+        state.user = result.user;
+        state.profile = result.profile;
         toast("Account created. Welcome in.", "success");
         navigate("dashboard");
       });
@@ -1772,6 +1781,9 @@ async function handleResourceUpload(form, submit) {
 
 async function handleJavaUpload(form, submit) {
   await runAction(submit, async () => {
+    if (!state.session?.access_token || !state.user?.id) {
+      throw new Error("You are not signed in. Please sign in and try again.");
+    }
     const existing = form.dataset.id ? findJava(form.dataset.id) : null;
     const data = new FormData(form);
     await saveJavaCode(
@@ -1782,7 +1794,8 @@ async function handleJavaUpload(form, submit) {
         category: data.get("category"),
         sortKey: data.get("sortKey")
       },
-      existing
+      existing,
+      { session: state.session, user: state.user }
     );
     state.modal = null;
     toast(existing ? "Java source updated." : "Java source uploaded.", "success");
