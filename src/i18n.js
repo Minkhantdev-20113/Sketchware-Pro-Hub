@@ -1,7 +1,7 @@
 const STRINGS = {
   en: {
     "lang.en": "English",
-    "lang.my": "Burmese",
+    "lang.my": "မြန်မာ",
     "theme.light": "Light",
     "theme.dark": "Dark",
     "theme.system": "System",
