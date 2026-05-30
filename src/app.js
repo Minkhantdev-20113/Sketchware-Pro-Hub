@@ -79,6 +79,9 @@ const state = {
   locale: getLocale(),
   upload: { active: false, message: "", percent: 0, error: "", retry: null },
   uploadAbort: null,
+  /** Selected files kept in memory so Android re-renders do not clear picker state. */
+  uploadFiles: {},
+  uploadDraft: null,
   session: null,
   user: null,
   profile: null,
@@ -211,6 +214,7 @@ function render() {
 
   const content = renderProtectedPage();
   app.innerHTML = renderShell(content);
+  restorePendingUploadFiles();
 }
 
 async function boot() {
@@ -248,6 +252,9 @@ async function boot() {
       state.session = context.session;
       state.user = context.user;
       state.profile = context.profile;
+      const uploadModalOpen =
+        state.modal?.type === "resource-upload" || state.modal?.type === "java-upload";
+      if (uploadModalOpen) return;
       state.data.dashboard = null;
       render();
       await loadRouteData(true);
@@ -305,7 +312,8 @@ async function loadRouteData(force = false, options = {}) {
     toast(readableError(error), "error");
   } finally {
     state.dataLoading = false;
-    render();
+    if (!isUploadModalOpen()) render();
+    else restorePendingUploadFiles();
   }
 }
 
@@ -1410,6 +1418,7 @@ async function handleClick(event) {
       break;
     case "open-upload":
       resetUploadState();
+      clearUploadFiles();
       state.modal = { type: "resource-upload", route: actionEl.dataset.route };
       render();
       break;
@@ -1419,6 +1428,7 @@ async function handleClick(event) {
       break;
     case "close-modal":
       state.modal = null;
+      clearUploadFiles();
       render();
       break;
     case "open-project":
@@ -1521,6 +1531,11 @@ async function handleSubmit(event) {
 }
 
 function handleInput(event) {
+  const uploadForm = event.target.closest('[data-form="resource-upload"]');
+  if (uploadForm) {
+    saveUploadDraft(uploadForm);
+    return;
+  }
   const searchRoute = event.target.dataset.searchRoute;
   if (!searchRoute) return;
   const value = event.target.value;
@@ -1537,14 +1552,74 @@ function handleInput(event) {
 function handleChange(event) {
   const input = event.target;
   if (input.matches('input[type="file"]')) {
+    rememberUploadFile(input);
     updateFileSummary(input);
     if (input.dataset.autofillName) {
       const form = input.closest("form");
       const fileName = form?.elements.fileName;
       if (fileName && !fileName.value && input.files?.[0]) {
         fileName.value = input.files[0].name.replace(/\.[^.]+$/, "");
+        saveUploadDraft(form);
       }
     }
+  }
+}
+
+function isUploadModalOpen() {
+  return state.modal?.type === "resource-upload" || state.modal?.type === "java-upload";
+}
+
+function clearUploadFiles() {
+  state.uploadFiles = {};
+  state.uploadDraft = null;
+}
+
+function rememberUploadFile(input) {
+  if (!input?.name || !input.closest('[data-form="resource-upload"]')) return;
+  const file = input.files?.[0];
+  if (file) state.uploadFiles[input.name] = file;
+  else delete state.uploadFiles[input.name];
+}
+
+function getFormFile(form, name) {
+  return form.elements[name]?.files?.[0] || state.uploadFiles[name] || null;
+}
+
+function saveUploadDraft(form) {
+  if (!form?.matches('[data-form="resource-upload"]')) return;
+  state.uploadDraft = {
+    fileName: form.elements.fileName?.value || "",
+    description: form.elements.description?.value || "",
+    category: form.elements.category?.value || "",
+    sortKey: form.elements.sortKey?.value || ""
+  };
+}
+
+function restorePendingUploadFiles() {
+  if (state.modal?.type !== "resource-upload") return;
+  const form = document.querySelector('[data-form="resource-upload"]');
+  if (!form) return;
+
+  Object.entries(state.uploadFiles).forEach(([name, file]) => {
+    if (!file) return;
+    const input = form.elements[name];
+    if (!input || input.type !== "file") return;
+    try {
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      input.files = transfer.files;
+      updateFileSummary(input);
+    } catch (error) {
+      console.warn("[SketchVault] could not restore file input", name, error);
+    }
+  });
+
+  if (state.uploadDraft) {
+    const { fileName, description, category, sortKey } = state.uploadDraft;
+    if (form.elements.fileName && fileName) form.elements.fileName.value = fileName;
+    if (form.elements.description && description) form.elements.description.value = description;
+    if (form.elements.category && category) form.elements.category.value = category;
+    if (form.elements.sortKey && sortKey) form.elements.sortKey.value = sortKey;
   }
 }
 
@@ -1584,7 +1659,9 @@ function handleDrop(event) {
   zone.classList.remove("dragging");
   const input = zone.querySelector('input[type="file"]');
   if (!input || !event.dataTransfer?.files?.length) return;
-  input.files = event.dataTransfer.files;
+  const transfer = new DataTransfer();
+  transfer.items.add(event.dataTransfer.files[0]);
+  input.files = transfer.files;
   input.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
@@ -1606,7 +1683,7 @@ function bindTouchNavigation() {
       const touch = event.changedTouches[0];
       const dx = touch.clientX - startX;
       const dy = Math.abs(touch.clientY - startY);
-      if (dy > 70) return;
+      if (dy > 70 || state.modal) return;
       if (startX < 32 && dx > 80 && routeIsProtected()) {
         state.mobileNavOpen = true;
         render();
@@ -1657,7 +1734,8 @@ function selectFilterOption(button) {
 function updateFileSummary(input) {
   const summary = input.closest(".dropzone")?.querySelector(`[data-file-summary="${input.name}"]`);
   if (!summary) return;
-  summary.textContent = input.files?.[0] ? `${input.files[0].name} ${fileSize(input.files[0].size)}` : "No file selected";
+  const file = input.files?.[0] || state.uploadFiles[input.name];
+  summary.textContent = file ? `${file.name} ${fileSize(file.size)}` : "No file selected";
 }
 
 async function runAction(button, task, pendingText = "") {
@@ -1683,6 +1761,7 @@ async function runAction(button, task, pendingText = "") {
 function resetUploadState() {
   state.upload = { active: false, message: "", percent: 0, error: "", retry: null };
   state.uploadAbort = null;
+  if (!isUploadModalOpen()) clearUploadFiles();
 }
 
 function cancelActiveUpload() {
@@ -1732,10 +1811,11 @@ async function performResourceUpload(form, existing) {
   const route = form.dataset.route;
   const page = resourcePages[route];
   const data = new FormData(form);
-  const mainFile = form.elements.mainFile.files[0];
-  const iconFile = form.elements.iconFile?.files?.[0];
-  const previewOne = form.elements.previewOne?.files?.[0];
-  const previewTwo = form.elements.previewTwo?.files?.[0];
+  saveUploadDraft(form);
+  const mainFile = getFormFile(form, "mainFile");
+  const iconFile = getFormFile(form, "iconFile");
+  const previewOne = getFormFile(form, "previewOne");
+  const previewTwo = getFormFile(form, "previewTwo");
 
   if (!existing && !mainFile) throw new Error("Choose the main file before uploading.");
   if (page.requiresProjectAssets) {
@@ -1784,6 +1864,7 @@ async function handleResourceUpload(form, submit) {
     try {
       const saved = await performResourceUpload(form, existing);
       resetUploadState();
+      clearUploadFiles();
       state.modal = null;
       toast(existing ? "Resource updated." : t("upload.complete"), "success");
       patchResourceList(form.dataset.route, saved);
